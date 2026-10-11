@@ -3357,7 +3357,7 @@ mod tests {
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(dir.path().join("cache/search/cache.lock"))
+            .open(dir.path().join("cache/search-v8/cache.lock"))
             .unwrap();
         FileExt::lock_exclusive(&lock).unwrap();
         append(

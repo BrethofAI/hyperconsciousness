@@ -35,22 +35,22 @@ use crate::log::{Head, LocatedRecord, RecordLocation, Store};
 use crate::query;
 use crate::record::Record;
 
-const MANIFEST_MAGIC: &[u8; 4] = b"BQM7";
-const SEGMENT_MAGIC: &[u8; 4] = b"BQS7";
-const POSTINGS_MAGIC: &[u8; 4] = b"BQP7";
-const SEGMENT_PLAINTEXT_MAGIC: &[u8; 8] = b"HCSMET07";
+const MANIFEST_MAGIC: &[u8; 4] = b"BQM8";
+const SEGMENT_MAGIC: &[u8; 4] = b"BQS8";
+const POSTINGS_MAGIC: &[u8; 4] = b"BQP8";
+const SEGMENT_PLAINTEXT_MAGIC: &[u8; 8] = b"HCSMET08";
 const POSTINGS_PLAINTEXT_MAGIC: &[u8; 8] = b"HCSPOST7";
 const HEADER_LEN: usize = 4 + 4 + NONCE_LEN;
-const MANIFEST_CONTEXT: &str = "hyperconsciousness encrypted search manifest v7";
-const SEGMENT_CONTEXT: &str = "hyperconsciousness encrypted search metadata segment v7";
-const POSTINGS_CONTEXT: &str = "hyperconsciousness encrypted search postings segment v7";
-const SEGMENT_NAME_CONTEXT: &str = "hyperconsciousness search segment file name v7";
+const MANIFEST_CONTEXT: &str = "hyperconsciousness encrypted search manifest v8";
+const SEGMENT_CONTEXT: &str = "hyperconsciousness encrypted search metadata segment v8";
+const POSTINGS_CONTEXT: &str = "hyperconsciousness encrypted search postings segment v8";
+const SEGMENT_NAME_CONTEXT: &str = "hyperconsciousness search segment file name v8";
 const GRAM_CONTEXT: &str = "hyperconsciousness case-folded search gram v1";
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MANIFEST_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_PAGES: usize = 128;
-const PAGE_MAGIC: &[u8; 4] = b"BQC7";
-const PAGE_CONTEXT: &str = "hyperconsciousness encrypted search directory page v7";
+const PAGE_MAGIC: &[u8; 4] = b"BQC8";
+const PAGE_CONTEXT: &str = "hyperconsciousness encrypted search directory page v8";
 const MAX_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTHORS: usize = 16_384;
 const MAX_SEGMENTS: usize = 1_000_000;
@@ -367,6 +367,41 @@ impl Index {
 
     pub fn is_current(&self, store: &Store) -> Result<bool> {
         Ok(self.heads == store.cache_heads()?)
+    }
+
+    /// Local key-holder discovery over note text and file names. This matches
+    /// the CLI's existing local decryption authority, not a remote grant. MCP
+    /// and HTTP callers must continue using the grant-aware query APIs.
+    pub fn visit_local_discovery<K, F>(
+        &self,
+        store: &Store,
+        keys: &K,
+        text: &str,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        K: DataKeys + ?Sized,
+        F: FnMut(&Record, &[u8]) -> Result<()>,
+    {
+        if keys.cache_identity() != Some(self.fingerprint) || !self.is_current(store)? {
+            return Err(Error::Denied(
+                "local discovery index is stale for this key view",
+            ));
+        }
+        // Empty access scopes here describe the local key holder, never a
+        // remote caller. They let authenticated route filters skip whole shards.
+        self.visit_inner(keys, Some(text), Some((&[], 0)), &mut |entry, candidate| {
+            if candidate && matches!(entry.item.kind.as_str(), "note" | "file") {
+                let record = self.record(store, entry)?;
+                let payload = zeroize::Zeroizing::new(keys.open_record(&record)?);
+                visit(&record, &payload)?;
+            }
+            Ok(None)
+        })?;
+        if !self.is_current(store)? {
+            return Err(Error::Denied("local discovery changed during search"));
+        }
+        Ok(())
     }
 
     pub(crate) fn heads_len(&self) -> usize {
@@ -766,7 +801,7 @@ impl Index {
                 return Err(Error::Malformed("too many records in one search segment"));
             }
             let position = segment.entries.len() as u32;
-            let indexed_grams = normalized_grams(&payload);
+            let indexed_grams = payload_grams(&payload);
             if let Some(grams) = &indexed_grams {
                 for gram in grams {
                     segment.grams.entry(*gram).or_default().push(position);
@@ -921,7 +956,7 @@ impl Index {
             let Ok(directory) = serde_json::from_slice::<StoredDirectory>(&plaintext) else {
                 continue;
             };
-            if directory.schema != "hyperconsciousness.search-directory.v7"
+            if directory.schema != "hyperconsciousness.search-directory.v8"
                 || directory.pages.is_empty()
                 || directory.pages.len() > MAX_MANIFEST_PAGES
                 || directory.bytes > MAX_MANIFEST_PAGES * MANIFEST_PAGE_BYTES
@@ -982,7 +1017,7 @@ impl Index {
             pages.push(name);
         }
         let directory = serde_json::to_vec(&StoredDirectory {
-            schema: "hyperconsciousness.search-directory.v7".into(),
+            schema: "hyperconsciousness.search-directory.v8".into(),
             bytes: plaintext.len(),
             pages,
         })?;
@@ -1040,7 +1075,7 @@ impl Index {
 
     fn encode_manifest_bounded(&self, max: usize) -> Result<Vec<u8>> {
         let mut stored = StoredManifest {
-            schema: "hyperconsciousness.search-manifest.v7".to_string(),
+            schema: "hyperconsciousness.search-manifest.v8".to_string(),
             generation: self.generation,
             fingerprint: self.fingerprint.hex(),
             heads: self
@@ -1101,7 +1136,7 @@ impl Index {
 
     fn decode_manifest(root: &Path, bytes: &[u8]) -> Result<Self> {
         let stored: StoredManifest = serde_json::from_slice(bytes)?;
-        if stored.schema != "hyperconsciousness.search-manifest.v7"
+        if stored.schema != "hyperconsciousness.search-manifest.v8"
             || stored.heads.len() > MAX_AUTHORS
             || stored.segments.len() > MAX_SEGMENTS
         {
@@ -1790,6 +1825,23 @@ fn visit_tail(
     Ok(&head == expected)
 }
 
+// Keep raw-payload search compatible, and add decoded local-discovery fields.
+// JSON escapes (including Unicode, newlines and quotes) must never hide a hit.
+fn payload_grams(bytes: &[u8]) -> Option<BTreeSet<u64>> {
+    let mut combined = normalized_grams(bytes)?;
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        for field in ["text", "name"] {
+            if let Some(text) = value[field].as_str() {
+                combined.extend(normalized_grams(text.as_bytes())?);
+                if combined.len() > MAX_GRAMS_PER_RECORD {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(combined)
+}
+
 fn normalized_grams(bytes: &[u8]) -> Option<BTreeSet<u64>> {
     let normalized = String::from_utf8_lossy(bytes).to_lowercase();
     grams(normalized.as_bytes())
@@ -1975,7 +2027,7 @@ fn prepare_cache(root: &Path) -> Result<()> {
 }
 
 fn cache_dir(root: &Path) -> PathBuf {
-    root.join("cache").join("search")
+    root.join("cache").join("search-v8")
 }
 
 fn segments_dir(root: &Path) -> PathBuf {
@@ -2596,6 +2648,108 @@ mod tests {
         assert!(Index::load_slots(root.path(), &random_key())
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn local_discovery_opens_candidates_not_lifetime_payloads() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let keys = CountingKeys {
+            key: random_key(),
+            opened: Cell::new(0),
+        };
+        let mut payloads: Vec<_> = (0..50)
+            .map(|_| {
+                serde_json::json!({"kind":"note", "text":"unrelated ordinary history"}).to_string()
+            })
+            .collect();
+        payloads.push(serde_json::json!({"kind":"note", "text":"unique-candidate"}).to_string());
+        append(&store, &signing, &keys.key, &payloads);
+        let index = Index::load_or_build(root.path(), &store, &keys, Hash::of(keys.key.as_slice()))
+            .unwrap();
+        keys.opened.set(0);
+        let mut found = 0;
+        index
+            .visit_local_discovery(&store, &keys, "unique-candidate", |_, bytes| {
+                if String::from_utf8_lossy(bytes).contains("unique-candidate") {
+                    found += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(found, 1);
+        assert_eq!(
+            keys.opened.get(),
+            1,
+            "find must decrypt only matching candidates"
+        );
+    }
+
+    #[test]
+    fn local_discovery_preserves_decoded_json_matches_and_rejects_stale_keys() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let keys = CountingKeys {
+            key: random_key(),
+            opened: Cell::new(0),
+        };
+        let payloads = vec![
+            r#"{"kind":"note","text":"caf\u00e9 line\nquote\"slash\\ end"}"#.to_string(),
+            r#"{"kind":"file","name":"caf\u00e9.pdf"}"#.to_string(),
+            r#"{"kind":"secret_ref","text":"caf\u00e9 hidden"}"#.to_string(),
+        ];
+        append(&store, &signing, &keys.key, &payloads);
+        let index = Index::load_or_build(root.path(), &store, &keys, Hash::of(keys.key.as_slice()))
+            .unwrap();
+        for needle in ["café", "line\nquote\"slash\\", "é", "nothing"] {
+            let mut expected = Vec::new();
+            for (i, p) in payloads.iter().enumerate().take(2) {
+                let v: serde_json::Value = serde_json::from_str(p).unwrap();
+                if v["text"]
+                    .as_str()
+                    .or_else(|| v["name"].as_str())
+                    .unwrap()
+                    .contains(needle)
+                {
+                    expected.push(i as u64);
+                }
+            }
+            let mut found = Vec::new();
+            index
+                .visit_local_discovery(&store, &keys, needle, |record, bytes| {
+                    let v: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                    if v["text"]
+                        .as_str()
+                        .or_else(|| v["name"].as_str())
+                        .unwrap()
+                        .contains(needle)
+                    {
+                        found.push(record.seq);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            found.sort();
+            assert_eq!(found, expected, "{needle:?}");
+        }
+        let wrong = CountingKeys {
+            key: random_key(),
+            opened: Cell::new(0),
+        };
+        assert!(index
+            .visit_local_discovery(&store, &wrong, "café", |_, _| panic!("key view mismatch"))
+            .is_err());
+        append(
+            &store,
+            &signing,
+            &keys.key,
+            &[r#"{"kind":"note","text":"new café"}"#.to_string()],
+        );
+        assert!(index
+            .visit_local_discovery(&store, &keys, "café", |_, _| panic!("stale snapshot"))
+            .is_err());
     }
 
     fn append(store: &Store, signing: &SigningKey, key: &[u8; 32], payloads: &[String]) {

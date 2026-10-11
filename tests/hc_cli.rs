@@ -276,3 +276,75 @@ fn local_append_lock_wait_is_bounded_and_never_replays_an_uncertain_write() {
     assert!(start.elapsed() < std::time::Duration::from_secs(6));
     assert_eq!(lock.cache_head().unwrap(), before);
 }
+
+#[test]
+fn hc_find_index_matches_fallback_without_duplicates_and_sees_appended_notes() {
+    use fs4::fs_std::FileExt;
+    use hyperconsciousness::keyring::{DataKeys, RuntimeKeys};
+    use hyperconsciousness::{Clock, Identity, Record, Store};
+    std::env::set_var("BRAINMESH_NO_KEYSTORE", "1");
+    let root = tempfile::tempdir().unwrap();
+    let mut identity = Identity::load_or_create(root.path()).unwrap();
+    identity.create_brain().unwrap();
+    let keys = RuntimeKeys::open(root.path(), &identity).unwrap();
+    let store = Store::open(root.path()).unwrap();
+    let append = |text: &str| {
+        let log = store.log_for_write(identity.device()).unwrap();
+        let mut head = log.cache_head().unwrap();
+        let record = Record::create(
+            &identity.signing,
+            if head.empty { 0 } else { head.seq + 1 },
+            head.id,
+            Clock::new().now(),
+            keys.current_epoch(),
+            keys.current_key().unwrap(),
+            text.as_bytes(),
+        )
+        .unwrap();
+        log.append_new_batch(&[record], &mut head).unwrap();
+    };
+    append(r#"{"kind":"note","text":"search-caf\u00e9 first"}"#);
+    append(r#"{"kind":"note","text":"search-café second"}"#);
+    let find = || {
+        let out = Command::new(binary())
+            .args([
+                "find",
+                "search-café",
+                "--scope",
+                "hc",
+                "--limit",
+                "1",
+                "--dir",
+            ])
+            .arg(root.path())
+            .env("BRAINMESH_NO_KEYSTORE", "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let cold = find();
+    assert_eq!(cold.matches("hc  ").count(), 1);
+    assert!(cold.contains("1 more matches"));
+    assert_eq!(find(), cold);
+    // Missing derived shards rebuild without changing results.
+    fs::remove_dir_all(root.path().join("cache/search-v8/segments")).unwrap();
+    assert_eq!(find(), cold);
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join("cache/search-v8/cache.lock"))
+        .unwrap();
+    assert!(FileExt::try_lock_exclusive(&lock).unwrap());
+    append(r#"{"kind":"note","text":"search-café third"}"#);
+    // Stale + writer-busy index must fall back to the actual log.
+    let fallback = find();
+    assert_eq!(fallback.matches("hc  ").count(), 1);
+    assert!(fallback.contains("2 more matches"));
+    drop(lock);
+    assert_eq!(find(), fallback);
+}

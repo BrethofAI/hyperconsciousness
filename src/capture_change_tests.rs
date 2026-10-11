@@ -87,7 +87,7 @@ fn exact_retry_survives_restart_grant_renewal_and_lost_cache() {
     .unwrap();
     let reopened = Server::new(server.dir.clone(), vec![renewed]);
     // Only this disposable fixture's derived index is lost, not signed history.
-    std::fs::remove_dir_all(server.dir.join("cache").join("search")).unwrap();
+    std::fs::remove_dir_all(server.dir.join("cache").join("search-v8")).unwrap();
     let retry = write(&reopened, batch);
     for n in 0..2 {
         assert_eq!(retry["records"][n]["ref"], first["records"][n]["ref"]);

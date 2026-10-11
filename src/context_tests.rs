@@ -68,7 +68,7 @@ fn indexed_read_contention_does_not_fall_back_to_a_history_scan() {
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(server.dir.join("cache/search/cache.lock"))
+        .open(server.dir.join("cache/search-v8/cache.lock"))
         .unwrap();
     FileExt::lock_exclusive(&lock).unwrap();
     for (name, arguments) in [
@@ -126,7 +126,7 @@ fn retry_reopens_the_read_view_and_a_new_revocation_still_wins() {
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(server.dir.join("cache/search/cache.lock"))
+                .open(server.dir.join("cache/search-v8/cache.lock"))
                 .unwrap(),
         );
         FileExt::lock_exclusive(lock.as_ref().unwrap()).unwrap();

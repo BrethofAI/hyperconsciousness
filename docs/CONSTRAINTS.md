@@ -97,7 +97,7 @@ latency for lower resident plaintext/metadata retention. It does not zeroize
 returned text, hide process memory during a request, disable encrypted disk
 indexes, or erase history. The setting is not an agent tool argument.
 
-Search format v7 retains at most two encrypted directory generations, each with
+Search format v8 retains at most two encrypted directory generations, each with
 at most 128 one-MiB pages. The decoded directory still lives in memory; encrypted
 postings and metadata on disk still grow with history. The resident managed
 capture fold has a 50,000-record and conservative 16 MiB accounting budget;
@@ -408,3 +408,16 @@ recovered key.
   as well as addresses, timing and volume. TLS terminates only at a numeric
   loopback endpoint on the trusted node; missing or hidden outer SNI cannot be
   routed by this design.
+
+### Local discovery acceleration
+
+`hc find --scope hc` uses the same encrypted, key-view-bound search fold as
+query APIs. It still exact-matches decoded note text or file names and retains
+its existing lexical reference ordering and match counts. Candidate records
+are reopened and signature checked under the current data-key view. A busy,
+stale or damaged derived index falls back to the original local scan after
+throwing away partial hits. This does not widen MCP/HTTP grants. Format v8 adds
+decoded `text`/`name` grams alongside raw JSON grams so escaped Unicode, quotes
+and line breaks cannot suppress matches. The versioned `cache/search-v8`
+directory keeps older running binaries from replacing the new fold; it builds
+once from signed history and does not remove older cache files.

@@ -394,32 +394,30 @@ fn find_command(dir: &PathBuf, arguments: &[String]) -> Result<()> {
         let keys = runtime_keys(dir, &identity)?;
         let store = Store::open(dir)?;
         if matches!(scope.as_str(), "all" | "hc") {
-            for author in store.authors()? {
-                for record in store.log(author)?.iter_records()? {
-                    let record = record?;
-                    let Ok(bytes) = keys.open_record(&record) else {
-                        continue;
-                    };
-                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-                        continue;
-                    };
-                    if !matches!(value["kind"].as_str(), Some("note" | "file")) {
-                        continue;
+            let start = hits.len();
+            let mut collect = |record: &Record, bytes: &[u8]| {
+                collect_hc_discovery_hit(record, bytes, &needle, &mut hits);
+                Ok(())
+            };
+            let indexed = hyperconsciousness::search_index::Index::load_or_build(
+                dir,
+                &store,
+                &keys,
+                keys.cache_fingerprint(),
+            )
+            .and_then(|index| index.visit_local_discovery(&store, &keys, &needle, &mut collect));
+            if indexed.is_err() {
+                // Derived state may be missing, busy or damaged. Discard partial
+                // results before the established scan fallback, never duplicate
+                // hits or turn a cache failure into missing knowledge.
+                hits.truncate(start);
+                for author in store.authors()? {
+                    for record in store.log(author)?.iter_records()? {
+                        let record = record?;
+                        if let Ok(bytes) = keys.open_record(&record) {
+                            collect_hc_discovery_hit(&record, &bytes, &needle, &mut hits);
+                        }
                     }
-                    let Some(text) = value["text"].as_str().or_else(|| value["name"].as_str())
-                    else {
-                        continue;
-                    };
-                    if !text.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    hits.push(SearchHit {
-                        scope: "hc",
-                        label: format!("{}:{}", record.author.short(), record.seq),
-                        path: None,
-                        excerpt: compact_search_excerpt(text, &needle, 220),
-                        rank: 2,
-                    });
                 }
             }
         }
@@ -483,6 +481,32 @@ fn find_command(dir: &PathBuf, arguments: &[String]) -> Result<()> {
         println!("secret matches include opaque names and allowed operations only");
     }
     Ok(())
+}
+
+fn collect_hc_discovery_hit(
+    record: &Record,
+    bytes: &[u8],
+    needle: &str,
+    hits: &mut Vec<SearchHit>,
+) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    if !matches!(value["kind"].as_str(), Some("note" | "file")) {
+        return;
+    }
+    let Some(text) = value["text"].as_str().or_else(|| value["name"].as_str()) else {
+        return;
+    };
+    if text.to_lowercase().contains(needle) {
+        hits.push(SearchHit {
+            scope: "hc",
+            label: format!("{}:{}", record.author.short(), record.seq),
+            path: None,
+            excerpt: compact_search_excerpt(text, needle, 220),
+            rank: 2,
+        });
+    }
 }
 
 fn compact_search_excerpt(value: &str, needle: &str, maximum: usize) -> String {
