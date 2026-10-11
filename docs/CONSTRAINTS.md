@@ -337,6 +337,16 @@ recovered key.
   can remain under a content-addressed private part for HTTP Range continuation;
   it is never indexed, and a non-Range endpoint restarts from zero. A store
   that trusts its backup is a store with no signatures.
+- A bucket pull retains checked record hashes for one author at a time. Each
+  object still verifies every signature and predecessor and compares duplicate
+  ids for forks. The local writer lease covers apply only, never network waits.
+  A process-local cache avoids replaying lifetime ciphertext per remote segment;
+  it is reused only while all local segment paths, sizes and modification times
+  match (also device/inode/change time on Unix). A change or failed apply drops
+  that snapshot and requires a fresh chain scan. It is not persistent authority
+  or protection against a compromised local filesystem forging metadata; full
+  integrity checks remain separate. Incoming objects are never skipped merely
+  because their remote names or sizes match.
 - A repeated keyless-remote listing proves only that the provider claims the
   selected content-addresses and sizes at that moment. It is not a full
   integrity scrub, proof of future retention, or protection from deletion,

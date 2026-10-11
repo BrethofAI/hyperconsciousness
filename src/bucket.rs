@@ -33,7 +33,7 @@ use hyperconsciousness::durable;
 use hyperconsciousness::error::{Error, Result};
 use hyperconsciousness::guard;
 use hyperconsciousness::id::{DeviceId, Hash};
-use hyperconsciousness::log::Store;
+use hyperconsciousness::log::{BatchCache, Store};
 use hyperconsciousness::record::Record;
 
 use crate::sigv4::Signer;
@@ -961,6 +961,7 @@ where
     let mut accepted = 0usize;
     let mut already = 0usize;
     let mut seen = std::collections::BTreeSet::new();
+    let mut log_cache = BatchCache::default();
 
     for (key, size) in listed {
         if !seen.insert(key.clone()) {
@@ -1026,16 +1027,21 @@ where
             ObjectKind::Log(author) => {
                 let bytes = fetched.read()?;
                 let records = decode_log_object(&bytes, author)?;
-                let applied = hyperconsciousness::sync::apply(store, &records)?;
+                // The download is complete before acquiring the writer lease.
+                // Sorted bucket listings group each author's objects together;
+                // only that author's hashes are retained, not every ciphertext.
+                let (new_records, held_records) = store
+                    .log_for_write(author)?
+                    .append_batch_cached(&records, &mut log_cache)?;
                 accepted = accepted
                     .checked_add(
-                        usize::try_from(applied.accepted)
+                        usize::try_from(new_records)
                             .map_err(|_| Error::Malformed("bucket accepted count overflow"))?,
                     )
                     .ok_or(Error::Malformed("bucket accepted count overflow"))?;
                 already = already
                     .checked_add(
-                        usize::try_from(applied.already_had)
+                        usize::try_from(held_records)
                             .map_err(|_| Error::Malformed("bucket existing count overflow"))?,
                     )
                     .ok_or(Error::Malformed("bucket existing count overflow"))?;
@@ -1365,6 +1371,76 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(store.authors().unwrap().is_empty());
+    }
+
+    #[test]
+    fn segmented_log_pull_releases_writer_during_download_and_retries_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let signing = SigningKey::generate(&mut OsRng);
+        let author = DeviceId(signing.verifying_key().to_bytes());
+        let key = random_key();
+        let mut previous = ZERO_HASH;
+        let mut objects = std::collections::BTreeMap::new();
+        for seq in 0..6 {
+            let record = Record::create(
+                &signing,
+                seq,
+                previous,
+                Clock::new().now(),
+                1,
+                &key,
+                b"synthetic remote receipt",
+            )
+            .unwrap();
+            previous = record.id();
+            objects.insert(
+                format!("brain/log/{}/{:06}", author.hex(), seq + 1),
+                record.encode(),
+            );
+        }
+        let listed: Vec<_> = objects
+            .iter()
+            .map(|(key, bytes)| (key.clone(), bytes.len() as u64))
+            .collect();
+        let mut downloads = 0;
+        let result = pull_listed(dir.path(), "brain/", listed.clone(), &store, |key, _| {
+            let _local_writer = store.log_for_write(author)?;
+            downloads += 1;
+            if downloads == 4 {
+                return Err(Error::Malformed("synthetic interruption"));
+            }
+            Ok(objects[key].clone().into())
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            store.log_for_write(author).unwrap().verify_chain().unwrap(),
+            3
+        );
+        let result = pull_listed(dir.path(), "brain/", listed.clone(), &store, |key, _| {
+            let _local_writer = store.log_for_write(author)?;
+            Ok(objects[key].clone().into())
+        })
+        .unwrap();
+        assert_eq!(result, (3, 3));
+        assert_eq!(
+            pull_listed(dir.path(), "brain/", listed.clone(), &store, |key, _| {
+                Ok(objects[key].clone().into())
+            })
+            .unwrap(),
+            (0, 6)
+        );
+        // A same-name, same-size rewrite must still be downloaded and rejected.
+        let first = objects.values_mut().next().unwrap();
+        first[hyperconsciousness::record::HEADER_LEN] ^= 1;
+        assert!(pull_listed(dir.path(), "brain/", listed, &store, |key, _| {
+            Ok(objects[key].clone().into())
+        })
+        .is_err());
+        assert_eq!(
+            store.log_for_write(author).unwrap().verify_chain().unwrap(),
+            6
+        );
     }
 
     #[test]

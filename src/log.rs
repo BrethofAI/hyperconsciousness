@@ -47,6 +47,25 @@ pub struct Log {
     lock: Option<File>,
 }
 
+/// Short-lived acceleration for repeated network batches. It contains only
+/// record hashes, never plaintext or authority that survives this process.
+#[derive(Default)]
+pub struct BatchCache {
+    snapshot: Option<(PathBuf, Vec<SegmentStamp>)>,
+    known: Vec<Hash>,
+    #[cfg(test)]
+    scanned: usize,
+}
+
+#[derive(PartialEq, Eq)]
+struct SegmentStamp {
+    path: PathBuf,
+    length: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
 /// Stable local coordinates for one record inside an append-only author log.
 ///
 /// This is derived cache metadata, never durable authority. Callers must still
@@ -802,30 +821,84 @@ impl Log {
     }
 
     /// Validate an offered tail completely, then persist it with one durable
-    /// flush per segment. This is the network ingestion path: taking the
-    /// writer lock once prevents a sync and a local append from racing, while
-    /// preflight means a bad late record cannot leave a good prefix committed.
+    /// flush per segment. Invalid late records never commit a valid prefix.
     pub fn append_batch(&self, records: &[Record]) -> Result<(u64, u64)> {
+        self.append_batch_cached(records, &mut BatchCache::default())
+    }
+
+    fn segment_stamps(&self) -> Result<Vec<SegmentStamp>> {
+        self.segments()?
+            .into_iter()
+            .map(|path| {
+                let meta = fs::symlink_metadata(&path)?;
+                if !meta.is_file() {
+                    return Err(Error::Malformed("log segment is not a regular file"));
+                }
+                #[cfg(unix)]
+                use std::os::unix::fs::MetadataExt;
+                Ok(SegmentStamp {
+                    path,
+                    length: meta.len(),
+                    modified: meta.modified()?,
+                    #[cfg(unix)]
+                    identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+                })
+            })
+            .collect()
+    }
+
+    /// Reuse checked record ids while the append-only local segments are
+    /// unchanged. Acquire a fresh writer lock for each call, so network waits
+    /// do not lock out local capture. The cache is process-local, scoped to one
+    /// author directory, and invalidated by any changed/replaced/added segment
+    /// or failed batch. It is not a substitute for a full disk integrity scrub.
+    pub fn append_batch_cached(
+        &self,
+        records: &[Record],
+        cache: &mut BatchCache,
+    ) -> Result<(u64, u64)> {
         if self.lock.is_none() {
             return Err(Error::Denied("batch append requires the writer lock"));
         }
         self.ensure_live()?;
-
-        let mut known = Vec::new();
-        let mut previous = ZERO_HASH;
-        for (index, record) in self.iter_records()?.enumerate() {
-            let record = record?;
-            if record.author != self.author || record.seq != index as u64 || record.prev != previous
-            {
-                return Err(Error::Chain {
-                    seq: record.seq,
-                    reason: "stored log is not a gapless chain",
-                });
+        // Clear before any fallible work: errors or partial durable writes must
+        // never leave a cache describing bytes that were not committed.
+        let previous_snapshot = cache.snapshot.take();
+        let snapshot = (self.dir.canonicalize()?, self.segment_stamps()?);
+        let current = previous_snapshot.as_ref() == Some(&snapshot);
+        if !current {
+            cache.known.clear();
+            let mut previous = ZERO_HASH;
+            for (index, record) in self.iter_records()?.enumerate() {
+                let record = record?;
+                #[cfg(test)]
+                {
+                    cache.scanned += 1;
+                }
+                if record.author != self.author
+                    || record.seq != index as u64
+                    || record.prev != previous
+                {
+                    return Err(Error::Chain {
+                        seq: record.seq,
+                        reason: "stored log is not a gapless chain",
+                    });
+                }
+                previous = record.id();
+                cache.known.push(previous);
             }
-            previous = record.id();
-            known.push(previous);
         }
+        let result = self.append_batch_known(records, &mut cache.known)?;
+        // Duplicate-only input does not change local bytes or segment metadata.
+        cache.snapshot = Some(if result.0 == 0 {
+            snapshot
+        } else {
+            (snapshot.0, self.segment_stamps()?)
+        });
+        Ok(result)
+    }
 
+    fn append_batch_known(&self, records: &[Record], known: &mut Vec<Hash>) -> Result<(u64, u64)> {
         let mut pending = Vec::new();
         let mut already_had = 0u64;
         for record in records {
@@ -866,6 +939,10 @@ impl Log {
             }
             known.push(record.id());
             pending.push(record);
+        }
+
+        if pending.is_empty() {
+            return Ok((0, already_had));
         }
 
         let mut path = self.last_segment()?;
@@ -1325,6 +1402,197 @@ mod tests {
         .unwrap();
         assert!(log.append_batch(&[gap]).is_err());
         assert_eq!(log.verify_chain().unwrap(), 200);
+    }
+
+    #[test]
+    fn repeated_network_batches_scan_history_once_and_release_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut writer = Writer::new();
+        let log = store.log_for_write(writer.device()).unwrap();
+        let records: Vec<_> = (0..40).map(|_| writer.write(&log, "history")).collect();
+        drop(log);
+        let mut cache = BatchCache::default();
+        for batch in records.chunks(2) {
+            let log = store.log_for_write(writer.device()).unwrap();
+            assert_eq!(log.append_batch_cached(batch, &mut cache).unwrap(), (0, 2));
+        }
+        assert_eq!(
+            cache.scanned,
+            records.len(),
+            "a pull must not reread lifetime history per segment"
+        );
+        assert_eq!(
+            store
+                .log_for_write(writer.device())
+                .unwrap()
+                .verify_chain()
+                .unwrap(),
+            40
+        );
+    }
+
+    #[test]
+    fn cached_batches_observe_local_appends_and_reject_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut writer = Writer::new();
+        let mut cache = BatchCache::default();
+        let log = store.log_for_write(writer.device()).unwrap();
+        let first = writer.write(&log, "first");
+        log.append_batch_cached(&[first], &mut cache).unwrap();
+        drop(log);
+        let log = store.log_for_write(writer.device()).unwrap();
+        let second = writer.write(&log, "a concurrent local capture");
+        assert_eq!(
+            log.append_batch_cached(&[second.clone()], &mut cache)
+                .unwrap(),
+            (0, 1)
+        );
+        assert_eq!(cache.scanned, 3, "local append invalidates the snapshot");
+        let fork = Record::create(
+            &writer.signing,
+            second.seq,
+            second.prev,
+            writer.clock.now(),
+            1,
+            &writer.key,
+            b"conflicting signed history",
+        )
+        .unwrap();
+        assert!(matches!(
+            log.append_batch_cached(&[fork], &mut cache),
+            Err(Error::Fork { .. })
+        ));
+        assert!(log.is_frozen());
+        assert!(log.append_batch_cached(&[second], &mut cache).is_err());
+    }
+
+    #[test]
+    fn a_failed_cached_batch_rebuilds_before_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut writer = Writer::new();
+        let log = store.log_for_write(writer.device()).unwrap();
+        let mut cache = BatchCache::default();
+        log.append_batch_cached(&[], &mut cache).unwrap();
+        let first = Record::create(
+            &writer.signing,
+            0,
+            ZERO_HASH,
+            writer.clock.now(),
+            1,
+            &writer.key,
+            b"first",
+        )
+        .unwrap();
+        let mut invalid = Record::create(
+            &writer.signing,
+            1,
+            first.id(),
+            writer.clock.now(),
+            1,
+            &writer.key,
+            b"invalid later signature",
+        )
+        .unwrap();
+        invalid.sealed[0] ^= 1;
+        assert!(log
+            .append_batch_cached(&[first.clone(), invalid], &mut cache)
+            .is_err());
+        assert!(log.head().unwrap().empty);
+        assert!(cache.snapshot.is_none());
+        assert_eq!(
+            log.append_batch_cached(&[first], &mut cache).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(log.verify_chain().unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_batches_detect_same_size_local_damage_even_with_restored_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut writer = Writer::new();
+        let log = store.log_for_write(writer.device()).unwrap();
+        let first = writer.write(&log, "first");
+        writer.write(&log, "second");
+        let mut cache = BatchCache::default();
+        log.append_batch_cached(&[first.clone()], &mut cache)
+            .unwrap();
+        let path = log.last_segment().unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[crate::record::HEADER_LEN] ^= 1;
+        fs::write(&path, bytes).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(log.append_batch_cached(&[first], &mut cache).is_err());
+        assert!(cache.snapshot.is_none());
+    }
+
+    #[test]
+    fn cached_batches_do_not_share_history_between_stores() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new();
+        let log = Store::open(a.path())
+            .unwrap()
+            .log_for_write(writer.device())
+            .unwrap();
+        let record = writer.write(&log, "one");
+        let mut cache = BatchCache::default();
+        assert_eq!(
+            log.append_batch_cached(&[record.clone()], &mut cache)
+                .unwrap(),
+            (0, 1)
+        );
+        let other = Store::open(b.path())
+            .unwrap()
+            .log_for_write(writer.device())
+            .unwrap();
+        assert_eq!(
+            other.append_batch_cached(&[record], &mut cache).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(other.verify_chain().unwrap(), 1);
+    }
+
+    #[test]
+    #[ignore = "manual synthetic history replay timing"]
+    fn cached_bucket_ingestion_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut writer = Writer::new();
+        let log = store.log_for_write(writer.device()).unwrap();
+        let payload = "x".repeat(64 * 1024);
+        let records: Vec<_> = (0..400).map(|_| writer.write(&log, &payload)).collect();
+        drop(log);
+        let start = std::time::Instant::now();
+        for batch in records.chunks(8) {
+            store
+                .log_for_write(writer.device())
+                .unwrap()
+                .append_batch(batch)
+                .unwrap();
+        }
+        let uncached = start.elapsed();
+        let mut cache = BatchCache::default();
+        let start = std::time::Instant::now();
+        for batch in records.chunks(8) {
+            store
+                .log_for_write(writer.device())
+                .unwrap()
+                .append_batch_cached(batch, &mut cache)
+                .unwrap();
+        }
+        eprintln!("synthetic 400 records / 50 batches: uncached={uncached:?} cached={:?} historical_records_scanned={}", start.elapsed(), cache.scanned);
+        assert_eq!(cache.scanned, 400);
     }
 
     #[test]
