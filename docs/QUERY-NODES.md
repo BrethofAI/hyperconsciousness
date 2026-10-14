@@ -82,8 +82,11 @@ hc mcp
 The opt-in `defaultReader` means unqualified `hc mcp` and `hc find` use this
 connection. MCP retains the server's normal tools, arguments, ranking, references,
 clipping, cursors and error results; it does not add a `remote_search` tool.
-`hc find` displays its familiar `hc  <reference> — <excerpt>` rows using the
-server's grant-scoped literal search. MCP offers the existing ranked mode.
+`hc find` discovers the advertised search schema before requesting optional
+fields. Core HC results use the familiar `hc  <reference> — <excerpt>` rows;
+hosted readers that expose text results retain their references, clipping notices
+and continuation cursors. It never retries a refused query with broader scope.
+MCP offers the existing ranked mode when the selected reader advertises it.
 
 Explicit `--as`, `--space`, `--dir`, `HC_DIR` or `BRAINMESH_DIR` retains local
 selection. `hc find --local ...` also bypasses the default. `--remote` explicitly

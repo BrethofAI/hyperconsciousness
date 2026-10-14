@@ -92,6 +92,11 @@ impl Session {
     }
 }
 
+pub(crate) enum FindResult {
+    Structured(Vec<hyperconsciousness::discovery::SearchHit>, bool),
+    Text(String),
+}
+
 pub(crate) struct Client {
     store: Storage,
     profile: Profile,
@@ -286,17 +291,60 @@ impl Client {
     }
 
     /// Normal discovery presentation over the same grant-scoped search tool.
-    pub fn find(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<(Vec<hyperconsciousness::discovery::SearchHit>, bool)> {
-        let reply = self.request(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":"search","arguments":{"query":query,"limit":limit,
-                "format":"structured","max_chars":220,"max_output_chars":60000}}}))?;
+    pub fn find(&self, query: &str, limit: usize) -> Result<FindResult> {
+        // Hosted readers may advertise a narrower schema than core HC. Discover
+        // before sending optional arguments; never retry a refused query broadly.
+        let discovery = self.request(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))?;
+        let search = discovery["result"]["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|t| t["name"] == "search"))
+            .ok_or(Error::Malformed(
+                "this HC connection does not expose search",
+            ))?;
+        let properties = &search["inputSchema"]["properties"];
+        let structured = properties.get("format").is_some();
+        let mut arguments = json!({"query":query,"limit":limit});
+        if properties.get("max_chars").is_some() {
+            arguments["max_chars"] = json!(220);
+        }
+        if properties.get("max_output_chars").is_some() {
+            arguments["max_output_chars"] = json!(60000);
+        }
+        if structured {
+            arguments["format"] = json!("structured");
+        }
+        let reply = self.request(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"search","arguments":arguments}}))?;
         if reply.get("error").is_some() || reply["result"]["isError"] == true {
             return Err(Error::Denied(
                 "HC search failed; no local fallback was used",
+            ));
+        }
+        if !structured {
+            let content = reply["result"]["content"]
+                .as_array()
+                .ok_or(Error::Malformed("invalid HC search content"))?;
+            let text = content
+                .iter()
+                .map(|item| {
+                    if item["type"] != "text" {
+                        return Err(Error::Malformed("HC search returned unsupported content"));
+                    }
+                    item["text"]
+                        .as_str()
+                        .ok_or(Error::Malformed("invalid HC search text"))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join("\n");
+            if text.is_empty() {
+                return Err(Error::Malformed("HC search returned an empty response"));
+            }
+            // Preserve the server's references, clipping and continuation, while
+            // refusing terminal control sequences from untrusted record text.
+            return Ok(FindResult::Text(
+                text.chars()
+                    .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+                    .collect(),
             ));
         }
         let page = &reply["result"]["structuredContent"];
@@ -329,7 +377,7 @@ impl Client {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok((hits, page["has_more"] == true))
+        Ok(FindResult::Structured(hits, page["has_more"] == true))
     }
 
     /// The same authenticated request path for stdio and shared HTTP clients.

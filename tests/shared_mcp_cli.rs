@@ -579,3 +579,65 @@ fn node_client_rejects_wrong_rpc_ids_redirects_and_rate_limits_without_leaking_b
         response.join().unwrap();
     }
 }
+
+#[test]
+fn hosted_find_uses_advertised_schema_and_preserves_text_references() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = std::thread::spawn(move || {
+        for index in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut input = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut bytes = vec![0; length];
+            input.read_exact(&mut bytes).unwrap();
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            let result = if index == 0 {
+                assert_eq!(message["method"], "tools/list");
+                json!({"tools":[{"name":"search","inputSchema":{"type":"object","additionalProperties":false,"properties":{"query":{"type":"string"},"limit":{"type":"number"}}}}]})
+            } else {
+                assert_eq!(
+                    message["params"]["arguments"],
+                    json!({"query":"canary","limit":2})
+                );
+                json!({"content":[{"type":"text","text":"2026-10-14  [abcd1234:2]  visible-canary\nnext_cursor: opaque-cursor"}]})
+            };
+            let body = json!({"jsonrpc":"2.0","id":message["id"],"result":result}).to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        }
+    });
+    let found = node_client(root.path(), &address)
+        .args(["find", "canary", "--scope", "hc", "--limit", "2"])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(found.stdout).unwrap(),
+        "2026-10-14  [abcd1234:2]  visible-canary\nnext_cursor: opaque-cursor\n"
+    );
+    server.join().unwrap();
+    assert!(!root.path().join("small-device/.brain").exists());
+}

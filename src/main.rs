@@ -401,14 +401,18 @@ fn find_command(dir: &PathBuf, arguments: &[String], remote: bool) -> Result<()>
         ));
     }
     let mut remote_more = false;
+    let mut remote_text = None;
     if remote && matches!(scope.as_str(), "all" | "hc" | "secrets") {
         if scope == "secrets" {
             return Err(Error::Denied("remote discovery does not expose secret capability names; use an explicit local store"));
         }
-        let (found, more) =
-            access_client::Client::open(hosted_cli::config_root())?.find(&query, limit)?;
-        hits.extend(found);
-        remote_more = more;
+        match access_client::Client::open(hosted_cli::config_root())?.find(&query, limit)? {
+            access_client::FindResult::Structured(found, more) => {
+                hits.extend(found);
+                remote_more = more;
+            }
+            access_client::FindResult::Text(text) => remote_text = Some(text),
+        }
     }
     if !remote && matches!(scope.as_str(), "all" | "hc" | "secrets") {
         let identity = Identity::load_for_brain(dir)?;
@@ -473,7 +477,7 @@ fn find_command(dir: &PathBuf, arguments: &[String], remote: bool) -> Result<()>
             .then_with(|| left.scope.cmp(right.scope))
             .then_with(|| left.label.to_lowercase().cmp(&right.label.to_lowercase()))
     });
-    if hits.is_empty() {
+    if hits.is_empty() && remote_text.is_none() {
         println!("nothing matched");
         return Ok(());
     }
@@ -497,6 +501,9 @@ fn find_command(dir: &PathBuf, arguments: &[String], remote: bool) -> Result<()>
     }
     if total > limit {
         println!("{} more matches; raise --limit to show them", total - limit);
+    }
+    if let Some(text) = remote_text {
+        println!("{text}");
     }
     if remote_more {
         println!("more matches on this node; narrow the query or raise --limit");
