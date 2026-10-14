@@ -1,7 +1,27 @@
 <!-- screenpipe — AI that knows everything you've seen, said, or heard -->
 <!-- https://screenpipe.com -->
 
-# HC alpha.12: preserve complete search evidence
+# HC alpha.13: recover safely from stale permission snapshots
+
+Indexed reads now prepare the search index before refreshing their permission
+snapshot. A snapshot invalidated by a concurrent append reports a transient read
+conflict and can use the existing bounded retry policy. Each attempt checks fresh
+authorization. Actual revocations, expired grants and integrity failures still
+refuse access; writes and one-time approved reads are not replayed.
+
+This release also includes the main-branch optional trusted query-node adapter.
+An explicitly configured reader can serve existing HC search and MCP calls
+without a local replica. Installed skill and PKM discovery remain local. The
+adapter respects the endpoint's advertised search schema, refuses redirects and
+does not silently fall back to another store. See [query-node setup](QUERY-NODES.md)
+for credential, timeout and offline limitations.
+
+These changes do not establish improved semantic recall or eliminate contention
+on a busy store. The existing three-attempt, 250 ms retry-start budget is unchanged.
+
+Install with `hc update`. HC remains a developer alpha.
+
+## Earlier alpha.12: preserve complete search evidence
 
 Search now returns the whole compacted note whenever it fits the excerpt budget,
 even when the query matches near the end. This preserves earlier qualifications

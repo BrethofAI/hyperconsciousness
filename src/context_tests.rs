@@ -168,10 +168,78 @@ fn retry_reopens_the_read_view_and_a_new_revocation_still_wins() {
 }
 
 #[test]
+fn stale_permission_read_retries_with_fresh_authority_and_revocation_still_wins() {
+    for revoke in [false, true] {
+        let (_dir, identity, server) = setup();
+        note(&server, &identity, "permission race evidence", PERSONAL);
+        let store = Store::open(&server.dir).unwrap();
+        let keys = RuntimeKeys::open(&server.dir, &identity).unwrap();
+        let stale_permissions = server.revocations(&store, &keys).unwrap();
+        // An append between permission capture and index preparation invalidates
+        // the exact-head permission fold, even if it was an ordinary note.
+        if revoke {
+            append(
+                &server.dir,
+                &identity,
+                &json!({"kind":"revoke", "grant":server.chain[0].id().hex()}).to_string(),
+            )
+            .unwrap();
+        } else {
+            note(&server, &identity, "concurrent unrelated note", PERSONAL);
+        }
+        let index = server.search_index(&store, &keys).unwrap();
+        let mut attempts = 0;
+        let result = retry_read_with_elapsed(
+            true,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    let index = index.read().unwrap();
+                    let error = hyperconsciousness::query::look_indexed(
+                        &store,
+                        &keys,
+                        &index,
+                        &stale_permissions,
+                        &server.chain,
+                        identity.grant_authority().unwrap(),
+                        Clock::new().now().millis,
+                        &hyperconsciousness::query::Filter::default(),
+                    )
+                    .err()
+                    .expect("stale permissions must never release evidence");
+                    assert_eq!(
+                        error.to_string(),
+                        "denied: revocation cache changed during indexed read"
+                    );
+                    return Err(error);
+                }
+                server.call_once(
+                    "search",
+                    &json!({"query":"permission race evidence"}),
+                    (None, None),
+                )
+            },
+            || std::time::Duration::ZERO,
+        );
+        assert_eq!(attempts, 2);
+        if revoke {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("revoked"));
+            assert!(!error.is_read_contention());
+        } else {
+            assert!(result.unwrap().contains("permission race evidence"));
+        }
+    }
+}
+
+#[test]
 fn retry_policy_is_bounded_and_never_replays_non_retryable_operations() {
     for (enabled, error_message, expected_attempts) in [
         (true, "capture history changed during read", 3),
         (true, "capture history changed during projection", 3),
+        (true, "revocation cache changed during indexed read", 3),
+        (false, "revocation cache changed during indexed read", 1),
+        (true, "revocation cache changed during permission check", 1),
         (false, "capture history changed during read", 1),
         (true, "grant revoked during read", 1),
         (true, "search snapshot prefix changed", 1),

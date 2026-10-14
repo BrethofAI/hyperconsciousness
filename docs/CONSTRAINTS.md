@@ -123,12 +123,16 @@ membership. Tail catch-up is capped at three passes, 10,000 records and 64 MiB.
 A busy control stream or repeated index cleanup can still refuse a read. MCP
 does not start a full-history scan after an indexed read fails. It retries only
 an exact allowlist of transient read conflicts and log locks, at most three
-attempts, and
-starts no further retry once 250 ms have elapsed. This is a retry-start budget,
+attempts, and starts no further retry once 250 ms have elapsed. This is a retry-start budget,
 not a timeout on an individual index build or read. Every attempt reopens keys,
 policy and the current view and repeats the original filters/cursor. Writes and
 reads using one-time approval IDs are never automatically replayed. Revocations,
 expired grants, integrity failures and resource-limit failures are not retried.
+Indexed reads prepare the search index before opening their exact-head permission
+view. A permission snapshot invalidated by a concurrent append is an explicit
+read conflict, not proof that a grant was revoked. That exact indexed-read
+conflict uses the same bounded retries with fresh authorization; a stale
+permission check for a non-read action remains non-retryable.
 MCP tool errors include the machine error in `_meta["hc/error"]` without
 returning structured result content. Transient conflicts include a same-read
 retry hint in their text and use `read_contention` and `retryable: true`,

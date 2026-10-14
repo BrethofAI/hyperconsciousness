@@ -964,11 +964,14 @@ impl Server {
                         )?
                     } else {
                         let indexed = (|| {
-                            let permissions = self.revocations(&store, &keys)?;
                             let index = self.search_index(&store, &keys)?;
                             let index = index
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            // Index preparation may span concurrent appends. Open
+                            // the exact-head permission fold immediately before
+                            // authorization, not before that potentially slow work.
+                            let permissions = self.revocations(&store, &keys)?;
                             (if ranked {
                                 hyperconsciousness::query::ranked::look_indexed
                             } else {
@@ -1117,11 +1120,14 @@ impl Server {
                         .ok_or(Error::Malformed("record needs a result ref"))?;
                     let answer = if hyperconsciousness::search_index::Index::exists(&self.dir) {
                         let indexed = (|| {
-                            let permissions = self.revocations(&store, &keys)?;
                             let index = self.search_index(&store, &keys)?;
                             let index = index
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            // Index preparation may span concurrent appends. Open
+                            // the exact-head permission fold immediately before
+                            // authorization, not before that potentially slow work.
+                            let permissions = self.revocations(&store, &keys)?;
                             hyperconsciousness::query::record_by_ref_indexed(
                                 &store,
                                 &keys,
@@ -1226,11 +1232,14 @@ impl Server {
                         )?
                     } else {
                         let indexed = (|| {
-                            let permissions = self.revocations(&store, &keys)?;
                             let index = self.search_index(&store, &keys)?;
                             let index = index
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            // Index preparation may span concurrent appends. Open
+                            // the exact-head permission fold immediately before
+                            // authorization, not before that potentially slow work.
+                            let permissions = self.revocations(&store, &keys)?;
                             hyperconsciousness::query::overview_indexed(
                                 &store,
                                 &keys,
@@ -1562,11 +1571,14 @@ impl Server {
                         )?
                     } else {
                         let indexed = (|| {
-                            let permissions = self.revocations(&store, &keys)?;
                             let index = self.search_index(&store, &keys)?;
                             let index = index
                                 .read()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            // Index preparation may span concurrent appends. Open
+                            // the exact-head permission fold immediately before
+                            // authorization, not before that potentially slow work.
+                            let permissions = self.revocations(&store, &keys)?;
                             hyperconsciousness::query::look_indexed(
                                 &store,
                                 &keys,

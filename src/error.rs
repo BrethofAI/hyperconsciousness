@@ -92,6 +92,7 @@ impl Error {
             self,
             Error::Denied(
                 "search index is being refreshed"
+                    | "revocation cache changed during indexed read"
                     | "search index cache shard is missing"
                     | "search index changed during query"
                     | "search index changed during point read"
@@ -184,6 +185,7 @@ mod tests {
             "search index is being refreshed",
             "capture history changed during read",
             "snapshot changed during capture read",
+            "revocation cache changed during indexed read",
         ] {
             let error = Error::Denied(message).machine();
             assert_eq!(error.error.code, "read_contention");
@@ -191,6 +193,7 @@ mod tests {
         }
         for message in [
             "grant revoked during read",
+            "revocation cache changed during permission check",
             "runtime key view changed during read",
             "search snapshot prefix changed",
             "search snapshot tail changed",
