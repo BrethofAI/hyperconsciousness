@@ -12,9 +12,7 @@ use hyperconsciousness::error::{Error, Result};
 use std::{io, path::PathBuf, process::Command};
 
 pub(crate) fn run(args: &Args) -> Result<()> {
-    let root = std::env::var_os("HC_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config/hc/access"));
+    let root = config_root();
     if args.command == "setup" {
         let file = args
             .rest
@@ -71,7 +69,14 @@ pub(crate) fn run(args: &Args) -> Result<()> {
                 )?
             );
         }
-        eprintln!("HC connection saved for {}. Next: hc login", profile.origin);
+        if profile.credential_file.is_some() {
+            eprintln!(
+                "HC node connection saved for {}. Verify with hc status --remote",
+                profile.origin
+            );
+        } else {
+            eprintln!("HC connection saved for {}. Next: hc login", profile.origin);
+        }
         return Ok(());
     }
     let (http, transport_args) = if args.command == "mcp" {
@@ -82,7 +87,11 @@ pub(crate) fn run(args: &Args) -> Result<()> {
     let expected: &[&str] = if args.command == "login" && args.rest == ["--no-browser"] {
         &["--no-browser"]
     } else if matches!(args.command.as_str(), "mcp" | "status") {
-        &["--remote"]
+        if transport_args.is_empty() {
+            &[]
+        } else {
+            &["--remote"]
+        }
     } else {
         &[]
     };
@@ -116,5 +125,21 @@ pub(crate) fn run(args: &Args) -> Result<()> {
             None => client.mcp(io::stdin().lock(), io::stdout().lock()),
         },
         _ => Err(Error::Malformed("unknown HC access command")),
+    }
+}
+
+pub(crate) fn config_root() -> PathBuf {
+    std::env::var_os("HC_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".config/hc/access"))
+}
+
+/// No directory creation or personal-store access during route selection.
+pub(crate) fn default_reader() -> Result<bool> {
+    let path = config_root().join("connection.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+        Ok(_) => Ok(read_profile(&path)?.default_reader),
     }
 }

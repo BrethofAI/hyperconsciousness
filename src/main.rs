@@ -57,10 +57,10 @@ short command: hc.
   hc find <query> [--scope all|hc|skills|pkm|secrets] [--limit n]
                                   find knowledge and capabilities without exposing secret values
 
-  hc setup <connection.json> [--codex] configure a hosted reader
+  hc setup <connection.json> [--codex] configure a hosted or trusted-node reader
   hc login [--no-browser]          sign in to the configured host
   hc status --remote              verify host authentication and tool discovery
-  hc mcp --remote                 use the configured hosted reader
+  hc mcp --remote                 use the configured hosted or trusted-node reader
   hc logout                       revoke this hosted session
   hc update [--check | --enable | --disable]
                                   install or manage native release updates
@@ -289,6 +289,7 @@ struct Args {
     command: String,
     rest: Vec<String>,
     dir: PathBuf,
+    explicit_store: bool,
 }
 
 fn parse() -> Args {
@@ -298,6 +299,9 @@ fn parse() -> Args {
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".brain"));
 
+    let explicit_store = raw.iter().any(|a| a == "--dir")
+        || std::env::var_os("HC_DIR").is_some()
+        || std::env::var_os("BRAINMESH_DIR").is_some();
     if let Some(index) = raw.iter().position(|a| a == "--dir") {
         if index + 1 < raw.len() {
             dir = PathBuf::from(raw.remove(index + 1));
@@ -315,6 +319,7 @@ fn parse() -> Args {
         command,
         rest: raw,
         dir,
+        explicit_store,
     }
 }
 
@@ -340,7 +345,13 @@ fn option_value(arguments: &[String], name: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-fn find_command(dir: &PathBuf, arguments: &[String]) -> Result<()> {
+fn find_command(dir: &PathBuf, arguments: &[String], remote: bool) -> Result<()> {
+    let arguments: Vec<String> = arguments
+        .iter()
+        .filter(|v| !matches!(v.as_str(), "--remote" | "--local"))
+        .cloned()
+        .collect();
+    let arguments = &arguments;
     let scope = option_value(arguments, "--scope")?.unwrap_or_else(|| "all".to_string());
     if !matches!(scope.as_str(), "all" | "hc" | "skills" | "pkm" | "secrets") {
         return Err(Error::Malformed(
@@ -389,7 +400,17 @@ fn find_command(dir: &PathBuf, arguments: &[String]) -> Result<()> {
             &query,
         ));
     }
-    if matches!(scope.as_str(), "all" | "hc" | "secrets") {
+    let mut remote_more = false;
+    if remote && matches!(scope.as_str(), "all" | "hc" | "secrets") {
+        if scope == "secrets" {
+            return Err(Error::Denied("remote discovery does not expose secret capability names; use an explicit local store"));
+        }
+        let (found, more) =
+            access_client::Client::open(hosted_cli::config_root())?.find(&query, limit)?;
+        hits.extend(found);
+        remote_more = more;
+    }
+    if !remote && matches!(scope.as_str(), "all" | "hc" | "secrets") {
         let identity = Identity::load_for_brain(dir)?;
         let keys = runtime_keys(dir, &identity)?;
         let store = Store::open(dir)?;
@@ -477,7 +498,13 @@ fn find_command(dir: &PathBuf, arguments: &[String]) -> Result<()> {
     if total > limit {
         println!("{} more matches; raise --limit to show them", total - limit);
     }
-    if matches!(scope.as_str(), "all" | "secrets") {
+    if remote_more {
+        println!("more matches on this node; narrow the query or raise --limit");
+    }
+    if remote && scope == "all" {
+        println!("secret capability discovery remains local; use --local --scope secrets");
+    }
+    if !remote && matches!(scope.as_str(), "all" | "secrets") {
         println!("secret matches include opaque names and allowed operations only");
     }
     Ok(())
@@ -4312,9 +4339,40 @@ fn run() -> Result<()> {
         return updater::run(&args.rest, args.command == "__update").map_err(Error::from);
     }
     updater::maybe_start(&args.command);
+    let remote = args.rest.iter().any(|v| v == "--remote");
+    let local = args.rest.iter().any(|v| v == "--local");
+    if matches!(
+        args.command.as_str(),
+        "mcp" | "status" | "find" | "search-all"
+    ) && remote
+        && (local
+            || std::env::args().any(|v| v == "--dir")
+            || args
+                .rest
+                .iter()
+                .any(|v| matches!(v.as_str(), "--as" | "--space")))
+    {
+        return Err(Error::Malformed(
+            "choose either a remote reader or an explicit local store/grant",
+        ));
+    }
+    let discovery_needs_reader = matches!(args.command.as_str(), "find" | "search-all")
+        && !matches!(
+            option_value(&args.rest, "--scope")?.as_deref(),
+            Some("skills" | "pkm")
+        );
+    let default_remote = (args.command == "mcp" || discovery_needs_reader)
+        && !remote
+        && !local
+        && !args.explicit_store
+        && !args
+            .rest
+            .iter()
+            .any(|v| matches!(v.as_str(), "--as" | "--space"))
+        && hosted_cli::default_reader()?;
     if matches!(args.command.as_str(), "setup" | "login" | "logout")
-        || (matches!(args.command.as_str(), "status" | "mcp")
-            && args.rest.iter().any(|v| v == "--remote"))
+        || (matches!(args.command.as_str(), "status" | "mcp") && remote)
+        || (args.command == "mcp" && default_remote)
     {
         return hosted_cli::run(&args);
     }
@@ -4325,7 +4383,7 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        "find" | "search-all" => find_command(&args.dir, &args.rest),
+        "find" | "search-all" => find_command(&args.dir, &args.rest, remote || default_remote),
 
         "access" => access_cli::run(&args.dir, &args.rest),
 

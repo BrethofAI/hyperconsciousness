@@ -312,3 +312,270 @@ fn shared_token_rejects_symlinks_and_world_readable_files() {
         assert!(!String::from_utf8_lossy(&result.stderr).contains(TOKEN));
     }
 }
+
+fn node_client(root: &Path, address: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hc"));
+    command
+        .env("HC_CONFIG_DIR", root.join("client"))
+        .env("HOME", root.join("small-device"))
+        .env_remove("HC_DIR")
+        .env_remove("BRAINMESH_DIR")
+        .env("BRAINMESH_NO_KEYSTORE", "1");
+    let credential = root.join("node-credential.json");
+    hyperconsciousness::durable::write_private(
+        &credential,
+        &serde_json::to_vec(&json!({
+            "endpoint":format!("http://{address}"), "access_token":TOKEN
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let profile = root.join("node.json");
+    fs::write(
+        &profile,
+        serde_json::to_vec(&json!({
+            "version":1, "origin":format!("http://{address}"), "routePrefix":"",
+            "credentialFile":credential, "defaultReader":true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_hc"));
+    let result = setup
+        .args(["setup"])
+        .arg(profile)
+        .env("HC_CONFIG_DIR", root.join("client"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&result.stdout).contains(TOKEN));
+    command
+}
+
+fn client_rpc(command: &mut Command, request: &Value) -> Value {
+    if command.get_args().len() == 0 {
+        command.arg("mcp");
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn small_node_uses_the_same_search_and_record_without_replication() {
+    let root = tempfile::tempdir().unwrap();
+    let brain = root.path().join("brain");
+    let grant = fixture(&brain);
+    let server = start(
+        &["mcp", "--as", &grant, "--dir", brain.to_str().unwrap()],
+        root.path(),
+    );
+    let search = json!({"jsonrpc":"2.0","id":42,"method":"tools/call",
+        "params":{"name":"search","arguments":{"query":"canary","format":"structured","limit":1}}});
+    let remote = client_rpc(&mut node_client(root.path(), &server.1), &search);
+    assert_eq!(remote["id"], 42);
+    assert_eq!(
+        remote["result"]["structuredContent"]["schema"],
+        "hc.context.v1"
+    );
+    assert_eq!(
+        remote["result"]["structuredContent"]["items"][0]["text"],
+        "visible-canary"
+    );
+    assert!(!remote.to_string().contains("hidden-canary"));
+    let reference = remote["result"]["structuredContent"]["items"][0]["ref"].clone();
+    let record = json!({"jsonrpc":"2.0","id":"open","method":"tools/call",
+        "params":{"name":"record","arguments":{"ref":reference,"format":"structured"}}});
+    let remote_record = client_rpc(&mut node_client(root.path(), &server.1), &record);
+    assert_eq!(remote_record["id"], "open");
+    assert_eq!(
+        remote_record["result"]["structuredContent"]["items"][0]["text"],
+        "visible-canary"
+    );
+    let (status, direct) = request(&server.1, "POST", "/mcp", &auth(), &record.to_string());
+    assert_eq!(status, 200);
+    let direct: Value = serde_json::from_str(&direct).unwrap();
+    assert_eq!(
+        remote_record["result"]["structuredContent"]["items"],
+        direct["result"]["structuredContent"]["items"]
+    );
+    let found = node_client(root.path(), &server.1)
+        .args(["find", "canary", "--scope", "hc"])
+        .output()
+        .unwrap();
+    assert!(
+        found.status.success(),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let found = String::from_utf8(found.stdout).unwrap();
+    assert!(
+        found.contains("hc  ") && found.contains("visible-canary"),
+        "{found}"
+    );
+    assert!(!found.contains("hidden-canary"));
+    assert!(!root.path().join("small-device/.brain").exists());
+    assert!(!root.path().join("client/session.json").exists());
+    let ranked = client_rpc(
+        &mut node_client(root.path(), &server.1),
+        &json!({
+            "jsonrpc":"2.0", "id":43, "method":"tools/call", "params":{"name":"search", "arguments":{
+                "query":"visible canary", "mode":"relevance", "match_terms":"all", "format":"structured"
+            }}
+        }),
+    );
+    assert_eq!(ranked["result"]["structuredContent"]["order"], "relevance");
+    assert_eq!(
+        ranked["result"]["structuredContent"]["items"][0]["ref"],
+        reference
+    );
+    let write = client_rpc(
+        &mut node_client(root.path(), &server.1),
+        &json!({
+            "jsonrpc":"2.0", "id":44, "method":"tools/call", "params":{"name":"remember", "arguments":{"text":"must not write"}}
+        }),
+    );
+    assert!(write["result"]["isError"] == true || write.get("error").is_some());
+    let status = node_client(root.path(), &server.1)
+        .args(["status", "--remote"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    // Exact local grants remain local even with a remote default configured.
+    let local = client_rpc(
+        node_client(root.path(), &server.1).args([
+            "mcp",
+            "--as",
+            &grant,
+            "--dir",
+            brain.to_str().unwrap(),
+        ]),
+        &search,
+    );
+    assert_eq!(
+        local["result"]["structuredContent"]["items"],
+        remote["result"]["structuredContent"]["items"]
+    );
+}
+
+#[test]
+fn unavailable_or_denied_node_never_becomes_empty_results_or_local_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let brain = root.path().join("brain");
+    let grant = fixture(&brain);
+    let mut server = start(
+        &["mcp", "--as", &grant, "--dir", brain.to_str().unwrap()],
+        root.path(),
+    );
+    let query = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"search","arguments":{"query":"canary"}}});
+    let mut client = node_client(root.path(), &server.1);
+    hyperconsciousness::durable::write_private(&root.path().join("node-credential.json"), &serde_json::to_vec(&json!({
+        "endpoint":format!("http://{}",server.1),"access_token":"incorrect-but-well-formed-synthetic-token"
+    })).unwrap()).unwrap();
+    let denied = client_rpc(&mut client, &query);
+    assert_eq!(denied["error"]["code"], -32001);
+    assert!(denied.get("result").is_none());
+    // Server-side grant revocation applies even to a previously successful client.
+    let revoked = Command::new(env!("CARGO_BIN_EXE_hc"))
+        .args(["revoke", &grant, "--dir", brain.to_str().unwrap()])
+        .env("BRAINMESH_NO_KEYSTORE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        revoked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let revoked = client_rpc(&mut node_client(root.path(), &server.1), &query);
+    assert!(
+        revoked["result"]["isError"] == true || revoked.get("error").is_some(),
+        "{revoked}"
+    );
+    assert!(!revoked.to_string().contains("visible-canary"));
+    server.0.kill().unwrap();
+    server.0.wait().unwrap();
+    let offline = client_rpc(&mut node_client(root.path(), &server.1), &query);
+    assert_eq!(offline["error"]["code"], -32002);
+    let offline_find = node_client(root.path(), &server.1)
+        .args(["find", "canary", "--scope", "hc"])
+        .output()
+        .unwrap();
+    assert!(!offline_find.status.success());
+    assert!(!String::from_utf8_lossy(&offline_find.stdout).contains("nothing matched"));
+    assert!(!root.path().join("small-device/.brain").exists());
+    let local_skills = node_client(root.path(), &server.1)
+        .args(["find", "nothing-synthetic", "--scope", "skills"])
+        .output()
+        .unwrap();
+    assert!(local_skills.status.success());
+    let conflict = node_client(root.path(), &server.1)
+        .args(["find", "canary", "--remote", "--local"])
+        .output()
+        .unwrap();
+    assert!(!conflict.status.success());
+}
+
+#[test]
+fn node_client_rejects_wrong_rpc_ids_redirects_and_rate_limits_without_leaking_bodies() {
+    for (status, body, expected) in [
+        (
+            200,
+            r#"{"jsonrpc":"2.0","id":999,"result":{"private":"must not escape"}}"#,
+            -32000,
+        ),
+        (429, "private upstream body", -32003),
+        (302, "private redirect body", -32000),
+        (200, "not json private body", -32000),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let response = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut input = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut bytes = vec![0; length];
+            input.read_exact(&mut bytes).unwrap();
+            write!(stream,"HTTP/1.1 {status} Test\r\nLocation: http://127.0.0.1:1/stolen\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        });
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+        let reply = client_rpc(&mut node_client(root.path(), &address), &request);
+        assert_eq!(reply["error"]["code"], expected, "{reply}");
+        assert!(!reply.to_string().contains("private"));
+        assert!(!reply.to_string().contains(TOKEN));
+        response.join().unwrap();
+    }
+}

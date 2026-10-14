@@ -18,6 +18,16 @@ pub(crate) struct Profile {
     pub route_prefix: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// Opt-in default for unqualified MCP and HC discovery. Explicit stores win.
+    #[serde(default, rename = "defaultReader")]
+    pub default_reader: bool,
+    /// Absent for the existing hosted login flow. No secret bytes in profiles.
+    #[serde(
+        default,
+        rename = "credentialFile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_file: Option<std::path::PathBuf>,
 }
 
 fn default_name() -> String {
@@ -34,6 +44,29 @@ impl Profile {
             .map_err(|_| Error::Malformed("invalid HC connection file"))?;
         let origin =
             Url::parse(&profile.origin).map_err(|_| Error::Malformed("invalid HC origin"))?;
+        let node = profile.credential_file.is_some();
+        let loopback = origin.host_str().is_some_and(|host| {
+            host.trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        });
+        if profile
+            .credential_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(Error::Malformed(
+                "HC credentialFile must be an absolute private file path",
+            ));
+        }
+        let valid_prefix = (node && profile.route_prefix.is_empty())
+            || (profile.route_prefix.starts_with('/')
+                && profile.route_prefix[1..].split('/').all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+                }));
         if profile.version != 1
             || profile.name.is_empty()
             || profile.name.len() > 64
@@ -41,7 +74,7 @@ impl Profile {
                 .name
                 .bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-            || origin.scheme() != "https"
+            || !(origin.scheme() == "https" || (node && loopback && origin.scheme() == "http"))
             || origin.host_str().is_none()
             || !origin.username().is_empty()
             || origin.password().is_some()
@@ -49,17 +82,11 @@ impl Profile {
             || origin.query().is_some()
             || origin.fragment().is_some()
             || profile.origin.chars().any(char::is_control)
-            || !profile.route_prefix.starts_with('/')
             || profile.route_prefix.len() > 128
-            || !profile.route_prefix[1..].split('/').all(|part| {
-                !part.is_empty()
-                    && part
-                        .bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-            })
+            || !valid_prefix
         {
             return Err(Error::Malformed(
-                "HC connection requires a version-1 HTTPS origin and a simple route prefix",
+                "HC connection requires HTTPS (HTTP only for numeric loopback nodes) and a simple route prefix",
             ));
         }
         profile.origin = origin.origin().ascii_serialization();
@@ -123,5 +150,34 @@ mod tests {
             br#"{"version":1,"origin":"https://example.com","token":"secret"}"#
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn node_profiles_only_allow_tls_or_numeric_loopback_and_private_credential_paths() {
+        let credential = std::env::temp_dir().join("credential.json");
+        for origin in [
+            "https://node.example",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            let p = Profile::parse(&serde_json::to_vec(&json!({"version":1,"origin":origin,"routePrefix":"","credentialFile":credential,"defaultReader":true})).unwrap()).unwrap();
+            assert_eq!(p.endpoint(), origin);
+            assert!(p.default_reader);
+        }
+        for origin in [
+            "http://node.example",
+            "http://localhost:9000",
+            "http://192.168.1.2",
+            "https://node.example/private",
+            "https://user@node.example",
+        ] {
+            assert!(Profile::parse(&serde_json::to_vec(&json!({"version":1,"origin":origin,"routePrefix":"","credentialFile":credential})).unwrap()).is_err());
+        }
+        assert!(Profile::parse(br#"{"version":1,"origin":"https://node.example","routePrefix":"","credentialFile":"relative.json"}"#).is_err());
     }
 }

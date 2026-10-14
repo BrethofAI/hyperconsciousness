@@ -237,3 +237,113 @@ mod tests {
         assert!(Storage::open(root).is_err());
     }
 }
+
+/// Node-issued bearer credentials stay separate from public connection profiles.
+/// Bind to the exact origin AND route so copying a profile cannot redirect a token.
+pub(super) fn node_token(profile: &Profile) -> Result<zeroize::Zeroizing<String>> {
+    use std::io::Read;
+    let path = profile
+        .credential_file
+        .as_ref()
+        .ok_or(Error::Denied("no HC node credential configured"))?;
+    guard::no_symlink(path)?;
+    let before = fs::symlink_metadata(path)
+        .map_err(|_| Error::Denied("HC node credential is unavailable"))?;
+    if !before.is_file() {
+        return Err(Error::Denied(
+            "HC node credential must be a regular private file",
+        ));
+    }
+    verify_private(&before)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|_| Error::Denied("HC node credential is unavailable"))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(Error::Denied(
+            "HC node credential must be a regular private file",
+        ));
+    }
+    verify_private(&metadata)?;
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(8193).read_to_end(&mut bytes)?;
+    if bytes.len() > 8192 {
+        return Err(Error::Denied("HC node credential exceeds size limit"));
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Credential {
+        endpoint: String,
+        access_token: String,
+    }
+    let credential: Credential =
+        serde_json::from_slice(&bytes).map_err(|_| Error::Denied("invalid HC node credential"))?;
+    let token = zeroize::Zeroizing::new(credential.access_token);
+    if credential.endpoint != profile.endpoint()
+        || !(32..=4096).contains(&token.len())
+        || !token.bytes().all(|c| c.is_ascii_graphic())
+    {
+        return Err(Error::Denied(
+            "HC node credential does not match this connection",
+        ));
+    }
+    Ok(token)
+}
+
+#[cfg(test)]
+mod node_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn node_credentials_are_endpoint_bound_and_reloaded_after_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credential.json");
+        let profile = Profile::parse(&serde_json::to_vec(&json!({"version":1,"origin":"https://node.example","routePrefix":"","credentialFile":path})).unwrap()).unwrap();
+        let write = |endpoint: &str, token: &str| {
+            durable::write_private(
+                &path,
+                &serde_json::to_vec(&json!({"endpoint":endpoint,"access_token":token})).unwrap(),
+            )
+            .unwrap()
+        };
+        write("https://node.example", &"a".repeat(43));
+        assert_eq!(node_token(&profile).unwrap().as_str(), "a".repeat(43));
+        write("https://node.example", &"b".repeat(43));
+        assert_eq!(node_token(&profile).unwrap().as_str(), "b".repeat(43));
+        for endpoint in ["https://other.example", "https://node.example/other"] {
+            write(endpoint, &"a".repeat(43));
+            assert!(node_token(&profile).is_err());
+        }
+        write("https://node.example", "a\r\nsecret-header");
+        assert!(node_token(&profile).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn node_credentials_refuse_shared_permissions_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("credential.json");
+        durable::write_private(
+            &path,
+            &serde_json::to_vec(
+                &json!({"endpoint":"https://node.example","access_token":"a".repeat(43)}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let link = temp.path().join("link");
+        symlink(&path, &link).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        for candidate in [path, link] {
+            let profile = Profile::parse(&serde_json::to_vec(&json!({"version":1,"origin":"https://node.example","routePrefix":"","credentialFile":candidate})).unwrap()).unwrap();
+            assert!(node_token(&profile).is_err());
+        }
+    }
+}

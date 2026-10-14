@@ -194,6 +194,10 @@ Grants limit what the server returns. A process with access to the owner's OS
 account, files, or keys still has that access; grants do not sandbox it. Hosted
 model providers can see the plaintext returned through their grants.
 
+Small devices can [query a trusted HC node](docs/QUERY-NODES.md) through the same
+MCP tools and `hc find` interface without replicating the brain. An opt-in default
+reader preserves explicit local connections.
+
 The HTTP server supports OAuth/DPoP, capture, and owner-approval APIs for
 separate clients. It has no bundled application or approval UI. Existing
 `/mobile/...` API names are preserved for compatibility; removed client pages
